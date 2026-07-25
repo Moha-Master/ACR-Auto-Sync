@@ -1,0 +1,48 @@
+name: Sync images to ACR
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login to ACR
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | \
+          docker login "${{ vars.ACR_REGISTRY }}" \
+            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Sync all images
+        env:
+          IMAGES: ${{ vars.SYNC_IMAGES }}
+        run: |
+          echo "$IMAGES" | grep -v '^\s*#' | grep -v '^\s*$' | while IFS='|' read -r SOURCE NAME TAGS; do
+            [ -z "$SOURCE" ] && continue
+            
+            # 去除可能的 \r 和首尾空格
+            SOURCE=$(echo "$SOURCE" | tr -d '\r' | xargs)
+            NAME=$(echo "$NAME" | tr -d '\r' | xargs)
+            TAGS=$(echo "$TAGS" | tr -d '\r' | xargs)
+
+            IFS=',' read -ra TAG_LIST <<< "$TAGS"
+            for TAG in "${TAG_LIST[@]}"; do
+              TAG=$(echo "$TAG" | xargs)
+              ACR_IMAGE="${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/${NAME}:${TAG}"
+
+              echo "════════════════════════════════════"
+              echo "同步: $SOURCE:$TAG"
+              echo "  →  $ACR_IMAGE"
+              echo "════════════════════════════════════"
+
+              docker pull "${SOURCE}:${TAG}"
+              docker tag "${SOURCE}:${TAG}" "$ACR_IMAGE"
+              docker push "$ACR_IMAGE"
+
+              echo "✓ 完成"
+              echo ""
+            done
+          done
