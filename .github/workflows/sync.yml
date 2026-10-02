@@ -5,44 +5,337 @@ on:
     - cron: '0 */8 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# 防止定时与手动触发重叠运行（后来的排队，不取消进行中的）
+concurrency:
+  group: sync-images-acr
+  cancel-in-progress: false
+
 jobs:
-  sync:
+  # ---- 1. 解析 SYNC_IMAGES，生成并行矩阵 ----
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Generate sync matrix
+        id: gen
+        env:
+          IMAGES: ${{ vars.SYNC_IMAGES }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          raw = os.environ.get("IMAGES", "")
+          items, errors = [], []
+          for lineno, line in enumerate(raw.splitlines(), 1):
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              parts = [p.strip() for p in line.split("|")]
+              if len(parts) != 3:
+                  errors.append(f"第 {lineno} 行应为 SOURCE|NAME|TAGS 格式，实际: {line!r}")
+                  continue
+              source, name, tags = parts
+              tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+              if not source or not name or not tag_list:
+                  errors.append(f"第 {lineno} 行缺少 source/name/tags: {line!r}")
+                  continue
+              items.append({"source": source, "name": name, "tags": ",".join(tag_list)})
+
+          if errors:
+              print("❌ vars.SYNC_IMAGES 配置错误：", file=sys.stderr)
+              for e in errors:
+                  print(f"  - {e}", file=sys.stderr)
+              sys.exit(1)
+          if not items:
+              print("❌ vars.SYNC_IMAGES 为空或全部为注释，无镜像可同步", file=sys.stderr)
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps(items, separators=(",", ":")) + "\n")
+          print(f"✅ 矩阵生成完成，共 {len(items)} 个镜像。")
+          PYEOF
+
+  # ---- 2. 每镜像一个并行 job（预检分流：digest 去重主路径 / 降级保更新路径）----
+  sync:
+    name: sync ${{ matrix.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # 并发上限，默认 20，可通过仓库变量 MAX_PARALLEL 调整（正整数）
+      max-parallel: ${{ fromJSON(vars.MAX_PARALLEL || '20') }}
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q skopeo
+
+      - name: Write sync helper
+        run: |
+          cat > /tmp/sync-helper.py <<'PYEOF'
+          import hashlib, json, os, re, subprocess, sys
+
+          def raw(ref):
+              r = subprocess.run(["skopeo", "inspect", "--raw", ref],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  raise SystemExit(f"skopeo inspect {ref} failed: {r.stderr.strip()}")
+              return json.loads(r.stdout)
+
+          def sub_ref(ref, digest):
+              base = ref.split("@")[0]
+              base = re.sub(r":[^:/]+$", "", base)
+              return f"{base}@{digest}"
+
+          def is_attestation(entry):
+              p = entry.get("platform") or {}
+              ann = entry.get("annotations") or {}
+              return (p.get("os") == "unknown"
+                      or ann.get("vnd.docker.reference.type") == "attestation-manifest")
+
+          def is_index_mt(mt):
+              return "index" in mt or "manifest.list" in mt
+
+          def analyze(ref):
+              """分析镜像格式：真实平台 config digest 集合 + ACR 不兼容问题标记"""
+              top = raw(ref)
+              res = {"configs": [], "zstd": False, "empty": False}
+
+              def scan(mf):
+                  lmts = [l.get("mediaType", "") for l in mf.get("layers", [])]
+                  res["zstd"] = res["zstd"] or any("zstd" in x for x in lmts)
+                  res["empty"] = (res["empty"]
+                                  or "oci.empty" in mf.get("config", {}).get("mediaType", ""))
+                  return mf.get("config", {}).get("digest")
+
+              if isinstance(top, dict) and "manifests" in top:
+                  for m in top["manifests"]:
+                      cfg = scan(raw(sub_ref(ref, m["digest"])))
+                      if not is_attestation(m) and cfg:
+                          res["configs"].append(cfg)
+              else:
+                  res["configs"] = [scan(top)]
+
+              res["configs"] = sorted(res["configs"])
+              print(json.dumps(res))
+
+          def surgery(layout_dir):
+              """过滤 OCI layout 中的 attestation 条目（ACR 不接受 oci.empty config）"""
+              idx_path = os.path.join(layout_dir, "index.json")
+              with open(idx_path) as f:
+                  idx = json.load(f)
+              kept_entries, removed = [], 0
+
+              for e in idx.get("manifests", []):
+                  mt = e.get("mediaType", "")
+                  if is_index_mt(mt):
+                      blob_path = os.path.join(layout_dir, "blobs", "sha256",
+                                               e["digest"].split(":", 1)[1])
+                      with open(blob_path) as f:
+                          sub = json.load(f)
+                      before = len(sub.get("manifests", []))
+                      sub["manifests"] = [m for m in sub.get("manifests", [])
+                                          if not is_attestation(m)]
+                      removed += before - len(sub["manifests"])
+                      if before != len(sub["manifests"]):
+                          data = json.dumps(sub, separators=(",", ":")).encode()
+                          new_digest = hashlib.sha256(data).hexdigest()
+                          with open(os.path.join(layout_dir, "blobs", "sha256",
+                                                 new_digest), "wb") as f:
+                              f.write(data)
+                          e = dict(e)
+                          e["digest"] = "sha256:" + new_digest
+                          e["size"] = len(data)
+                      kept_entries.append(e)
+                  elif is_attestation(e):
+                      removed += 1
+                  else:
+                      kept_entries.append(e)
+
+              idx["manifests"] = kept_entries
+              with open(idx_path, "w") as f:
+                  json.dump(idx, f, indent=2)
+              print(f"手术完成：移除 {removed} 个 attestation 条目")
+
+          if sys.argv[1] == "analyze":
+              analyze(sys.argv[2])
+          elif sys.argv[1] == "surgery":
+              surgery(sys.argv[2])
+          PYEOF
+          python3 -c "import ast; ast.parse(open('/tmp/sync-helper.py').read())" && echo "helper 语法 OK"
+
       - name: Login to ACR
         run: |
           echo "${{ secrets.ACR_PASSWORD }}" | \
           docker login "${{ vars.ACR_REGISTRY }}" \
             -u "${{ secrets.ACR_USERNAME }}" --password-stdin
 
-      - name: Sync all images
+      - name: Sync tags
         env:
-          IMAGES: ${{ vars.SYNC_IMAGES }}
+          NAME: ${{ matrix.name }}
+          SOURCE: ${{ matrix.source }}
+          TAGS: ${{ matrix.tags }}
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
         run: |
-          echo "$IMAGES" | grep -v '^\s*#' | grep -v '^\s*$' | while IFS='|' read -r SOURCE NAME TAGS; do
-            [ -z "$SOURCE" ] && continue
-            
-            # 去除可能的 \r 和首尾空格
-            SOURCE=$(echo "$SOURCE" | tr -d '\r' | xargs)
-            NAME=$(echo "$NAME" | tr -d '\r' | xargs)
-            TAGS=$(echo "$TAGS" | tr -d '\r' | xargs)
+          SYNCED=0
+          DEGRADED=0
+          SKIPPED=0
+          FAILED_LIST=()
 
-            IFS=',' read -ra TAG_LIST <<< "$TAGS"
-            for TAG in "${TAG_LIST[@]}"; do
-              TAG=$(echo "$TAG" | xargs)
-              ACR_IMAGE="${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/${NAME}:${TAG}"
+          IFS=',' read -ra TAG_LIST <<< "$TAGS"
+          for TAG in "${TAG_LIST[@]}"; do
+            TAG=$(echo "$TAG" | xargs)
+            [ -z "$TAG" ] && continue
+            SRC_IMAGE="${SOURCE}:${TAG}"
+            ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${NAME}:${TAG}"
 
-              echo "════════════════════════════════════"
-              echo "同步: $SOURCE:$TAG"
-              echo "  →  $ACR_IMAGE"
-              echo "════════════════════════════════════"
+            echo "════════════════════════════════════"
+            echo "同步: $SRC_IMAGE"
+            echo "  →  $ACR_IMAGE"
 
-              docker pull "${SOURCE}:${TAG}"
-              docker tag "${SOURCE}:${TAG}" "$ACR_IMAGE"
-              docker push "$ACR_IMAGE"
+            # 1. 顶层 digest：相等即跳过（主路径最强判据）
+            SRC_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${SRC_IMAGE}" 2>/dev/null || true)
+            if [ -z "$SRC_DIGEST" ]; then
+              echo "  ✗ 获取源 digest 失败（源不可达？）"
+              FAILED_LIST+=("${SRC_IMAGE} - 源不可达")
+              continue
+            fi
+            DST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${ACR_IMAGE}" 2>/dev/null || true)
+            if [ "$SRC_DIGEST" = "$DST_DIGEST" ]; then
+              echo "  ✓ 无变化，跳过 (${SRC_DIGEST})"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
 
-              echo "✓ 完成"
-              echo ""
-            done
+            # 2. 预检上游格式：config 指纹 + ACR 不兼容问题标记
+            ANALYSIS=$(python3 /tmp/sync-helper.py analyze "docker://${SRC_IMAGE}" 2>/dev/null || true)
+            if [ -z "$ANALYSIS" ]; then
+              echo "  ✗ 预检失败（源不可达？）"
+              FAILED_LIST+=("${SRC_IMAGE} - 预检失败")
+              continue
+            fi
+            ZSTD=$(jq -r '.zstd' <<<"$ANALYSIS")
+            EMPTY=$(jq -r '.empty' <<<"$ANALYSIS")
+
+            if [ "$ZSTD" = "false" ] && [ "$EMPTY" = "false" ]; then
+              # ---- 主路径：完整复制，digest 与源一致 ----
+              echo "  主路径: skopeo copy --all（保留源 digest）"
+              if skopeo copy --all "docker://${SRC_IMAGE}" "docker://${ACR_IMAGE}"; then
+                DST_NEW=$(skopeo inspect --format '{{.Digest}}' "docker://${ACR_IMAGE}" 2>/dev/null || true)
+                if [ "$SRC_DIGEST" = "$DST_NEW" ]; then
+                  echo "  ✓ 完成，digest 一致 (${DST_NEW})"
+                  SYNCED=$((SYNCED + 1))
+                else
+                  echo "  ⚠ 完成但 digest 不一致: src=${SRC_DIGEST} dst=${DST_NEW}"
+                  FAILED_LIST+=("${SRC_IMAGE} - digest 不一致")
+                fi
+              else
+                echo "  ✗ skopeo copy 失败"
+                FAILED_LIST+=("${SRC_IMAGE} - copy 失败")
+              fi
+              continue
+            fi
+
+            # ---- 降级路径：上游含 ACR 不支持的格式（zstd 层 / oci.empty attestation）----
+            ISSUES=""
+            [ "$ZSTD" = "true" ] && ISSUES="zstd层"
+            [ "$EMPTY" = "true" ] && ISSUES="${ISSUES:+$ISSUES+}空config attestation"
+            echo "  降级路径: 检测到 ${ISSUES}"
+
+            # 降级去重：config digest 集合一致即跳过（顶层 digest 在降级模式下必然不同）
+            DST_ANALYSIS=$(python3 /tmp/sync-helper.py analyze "docker://${ACR_IMAGE}" 2>/tmp/dst-analyze-err.log || true)
+            if [ -z "$DST_ANALYSIS" ]; then
+              echo "  · ACR 侧暂无或分析失败，进入推送流程（首次同步属正常）"
+              DST_ANALYSIS='{}'
+            fi
+            SRC_CFG=$(jq -c '.configs // []' <<<"$ANALYSIS")
+            DST_CFG=$(jq -c '.configs // []' <<<"$DST_ANALYSIS")
+            if [ "$SRC_CFG" != "[]" ] && [ "$SRC_CFG" = "$DST_CFG" ]; then
+              echo "  ✓ 降级指纹（config 集合）一致，跳过"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            # 降级推送：拉到本地 OCI layout → 手术过滤 attestation → 按需转 gzip 后推送
+            LAYOUT=$(mktemp -d)
+            OK=true
+            if ! skopeo copy --all "docker://${SRC_IMAGE}" "oci:${LAYOUT}:t"; then
+              echo "  ✗ 拉取到本地 layout 失败"
+              OK=false
+            fi
+            if $OK && [ "$EMPTY" = "true" ]; then
+              python3 /tmp/sync-helper.py surgery "$LAYOUT" || OK=false
+            fi
+            if $OK; then
+              if [ "$ZSTD" = "true" ]; then
+                skopeo copy --all --dest-compress-format gzip \
+                  "oci:${LAYOUT}:t" "docker://${ACR_IMAGE}" || OK=false
+              else
+                skopeo copy --all "oci:${LAYOUT}:t" "docker://${ACR_IMAGE}" || OK=false
+              fi
+            fi
+            rm -rf "$LAYOUT"
+
+            if $OK; then
+              # 降级校验：config 指纹集合一致（顶层 digest 不参与校验）
+              DST_AFTER=$(python3 /tmp/sync-helper.py analyze "docker://${ACR_IMAGE}" 2>/dev/null || true)
+              if [ -n "$DST_AFTER" ]; then
+                DST_AFTER_CFG=$(jq -c '.configs // []' <<<"$DST_AFTER")
+              else
+                DST_AFTER_CFG="[]"
+              fi
+              if [ -n "$DST_AFTER" ] && [ "$SRC_CFG" = "$DST_AFTER_CFG" ]; then
+                echo "  ✓ 降级完成，config 指纹一致（顶层 digest 与源不同属预期）"
+                DEGRADED=$((DEGRADED + 1))
+              else
+                echo "  ⚠ 降级推送后 config 指纹不一致"
+                FAILED_LIST+=("${SRC_IMAGE} - 降级校验不一致")
+              fi
+            else
+              echo "  ✗ 降级推送失败"
+              FAILED_LIST+=("${SRC_IMAGE} - 降级推送失败")
+            fi
           done
+
+          echo "════════════════════════════════════"
+          echo "[${NAME}] 同步 ${SYNCED}，降级 ${DEGRADED}，跳过 ${SKIPPED}，失败 ${#FAILED_LIST[@]}"
+          {
+            echo "### ${NAME}"
+            echo "- 同步 ${SYNCED}，降级 ${DEGRADED}，跳过 ${SKIPPED}，失败 ${#FAILED_LIST[@]}"
+            if [ ${#FAILED_LIST[@]} -gt 0 ]; then
+              printf -- '- 失败: %s\n' "${FAILED_LIST[@]}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#FAILED_LIST[@]} -gt 0 ]; then
+            printf '  失败: %s\n' "${FAILED_LIST[@]}"
+            exit 1
+          fi
+
+  # ---- 3. 汇总：任一镜像失败则整个 run 失败（触发告警）----
+  report:
+    needs: [prepare, sync]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate result
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+        run: |
+          echo "prepare=${PREPARE_RESULT}  sync=${SYNC_RESULT}"
+          if [ "$PREPARE_RESULT" = "success" ] && [ "$SYNC_RESULT" = "success" ]; then
+            echo "✅ 所有镜像同步完成"
+          else
+            echo "❌ 存在失败的镜像 job，详见各 sync job 日志与 step summary"
+            exit 1
+          fi
