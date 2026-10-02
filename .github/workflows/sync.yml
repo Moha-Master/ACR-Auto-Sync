@@ -308,34 +308,80 @@ jobs:
 
           echo "════════════════════════════════════"
           echo "[${NAME}] 同步 ${SYNCED}，降级 ${DEGRADED}，跳过 ${SKIPPED}，失败 ${#FAILED_LIST[@]}"
+
+          # 结果写入文件（由 report job 下载合并成单条 summary）
           {
-            echo "### ${NAME}"
-            echo "- 同步 ${SYNCED}，降级 ${DEGRADED}，跳过 ${SKIPPED}，失败 ${#FAILED_LIST[@]}"
+            echo "RESULT|${NAME}|${SYNCED}|${DEGRADED}|${SKIPPED}|${#FAILED_LIST[@]}"
             if [ ${#FAILED_LIST[@]} -gt 0 ]; then
-              printf -- '- 失败: %s\n' "${FAILED_LIST[@]}"
+              printf 'FAIL|%s\n' "${FAILED_LIST[@]}"
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > "$RUNNER_TEMP/sync-result.txt"
 
           if [ ${#FAILED_LIST[@]} -gt 0 ]; then
             printf '  失败: %s\n' "${FAILED_LIST[@]}"
             exit 1
           fi
 
-  # ---- 3. 汇总：任一镜像失败则整个 run 失败（触发告警）----
+      - name: Upload sync result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-result-${{ matrix.name }}
+          path: ${{ runner.temp }}/sync-result.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # ---- 3. 汇总：合并所有 job 结果为单条 summary，任一镜像失败则整个 run 失败（触发告警）----
   report:
     needs: [prepare, sync]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Download sync results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sync-result-*
+          merge-multiple: true
+          path: /tmp/sync-results
+          if-no-files-found: ignore
+
       - name: Aggregate result
         env:
           PREPARE_RESULT: ${{ needs.prepare.result }}
           SYNC_RESULT: ${{ needs.sync.result }}
         run: |
           echo "prepare=${PREPARE_RESULT}  sync=${SYNC_RESULT}"
+
+          {
+            echo "## 镜像同步汇总"
+            echo ""
+            echo "| 镜像 | 同步 | 降级 | 跳过 | 失败 |"
+            echo "|:---|---:|---:|---:|---:|"
+            if ls /tmp/sync-results/*.txt >/dev/null 2>&1; then
+              for f in /tmp/sync-results/*.txt; do
+                grep '^RESULT|' "$f" | awk -F'|' \
+                  '{printf "| %s | %s | %s | %s | %s |\n", $2, $3, $4, $5, $6}'
+              done
+            else
+              echo "| _(无 job 产生结果，见 job 日志)_ | | | | |"
+            fi
+            echo ""
+            FAILS=$(grep -rh '^FAIL|' /tmp/sync-results/ 2>/dev/null | sed 's/^FAIL|//' || true)
+            if [ -n "$FAILS" ]; then
+              echo "**失败明细：**"
+              echo "$FAILS" | sed 's/^/- /'
+              echo ""
+            fi
+            if [ "$PREPARE_RESULT" = "success" ] && [ "$SYNC_RESULT" = "success" ]; then
+              echo "✅ 所有镜像同步完成"
+            else
+              echo "❌ 存在失败的镜像 job，详见失败明细与各 job 日志"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if [ "$PREPARE_RESULT" = "success" ] && [ "$SYNC_RESULT" = "success" ]; then
             echo "✅ 所有镜像同步完成"
           else
-            echo "❌ 存在失败的镜像 job，详见各 sync job 日志与 step summary"
+            echo "❌ 存在失败的镜像 job"
             exit 1
           fi
